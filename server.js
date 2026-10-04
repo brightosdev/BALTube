@@ -162,10 +162,11 @@ const upload = multer({
     cb(null, true);
   }
 });
-const app = express();
+
 app.use(cors({
   origin: true
 }));
+
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 
