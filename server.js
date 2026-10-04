@@ -164,7 +164,9 @@ const upload = multer({
 });
 
 app.use(cors({
-  origin: true
+  origin: FRONTEND_URL || true,
+  methods: ["GET", "POST", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
 }));
 
 app.use(express.json({ limit: "1mb" }));
