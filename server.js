@@ -744,6 +744,63 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error: "Internal server error." });
 });
 
+
+app.post("/api/recover-account", async (req, res, next) => {
+  try {
+    const suppliedSecret = String(req.body.secret || "");
+
+    if (
+      !process.env.BAL_RECOVERY_SECRET ||
+      suppliedSecret !== process.env.BAL_RECOVERY_SECRET
+    ) {
+      return res.status(403).json({
+        error: "Recovery not authorized."
+      });
+    }
+
+    const username = cleanText(req.body.username, 24);
+    const newPassword = String(req.body.newPassword || "");
+
+    if (!validUsername(username)) {
+      return res.status(400).json({
+        error: "Invalid username."
+      });
+    }
+
+    if (newPassword.length < 8 || newPassword.length > 200) {
+      return res.status(400).json({
+        error: "Password must be between 8 and 200 characters."
+      });
+    }
+
+    const user = db.prepare(`
+      SELECT id FROM users
+      WHERE username = ? COLLATE NOCASE
+    `).get(username);
+
+    if (!user) {
+      return res.status(404).json({
+        error: "Account not found."
+      });
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, 12);
+
+    db.prepare(`
+      UPDATE users
+      SET password = ?
+      WHERE id = ?
+    `).run(passwordHash, user.id);
+
+    res.json({
+      message: "Password reset successfully. You can now log in."
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+
 app.listen(PORT, () => {
   console.log(`BALTube backend running on port ${PORT}`);
   console.log(`Database: ${DB_PATH}`);
