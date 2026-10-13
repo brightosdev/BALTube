@@ -3,13 +3,14 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
-const Database = require("better-sqlite3");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const nodemailer = require("nodemailer");
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
+const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 
@@ -18,73 +19,33 @@ const JWT_SECRET = process.env.JWT_SECRET;
 const PUBLIC_URL = (process.env.PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/$/, "");
 const FRONTEND_URL = (process.env.FRONTEND_URL || "").replace(/\/$/, "");
 
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
+
+const VIDEO_BUCKET = "videos";
+const MAX_VIDEO_SIZE = 50 * 1024 * 1024;
+
 if (!JWT_SECRET) {
   console.error("ERROR: JWT_SECRET is not set.");
   process.exit(1);
 }
 
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
-const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(DATA_DIR, "uploads");
-const DB_PATH = process.env.DB_PATH || path.join(DATA_DIR, "baltube.db");
+if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
+  console.error("ERROR: SUPABASE_URL and SUPABASE_SECRET_KEY must be set in Render.");
+  process.exit(1);
+}
 
-fs.mkdirSync(DATA_DIR, { recursive: true });
+const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY, {
+  auth: {
+    persistSession: false,
+    autoRefreshToken: false,
+    detectSessionInUrl: false
+  }
+});
+
+// Temporary staging only. Permanent video files live in Supabase Storage.
+const UPLOAD_DIR = path.join(os.tmpdir(), "baltube-upload-staging");
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-
-const db = new Database(DB_PATH);
-db.pragma("journal_mode = WAL");
-db.pragma("foreign_keys = ON");
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    email TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    password TEXT NOT NULL,
-    email_verified INTEGER NOT NULL DEFAULT 0,
-    verification_token_hash TEXT,
-    verification_expires INTEGER,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS videos (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    title TEXT NOT NULL,
-    description TEXT NOT NULL DEFAULT '',
-    filename TEXT NOT NULL UNIQUE,
-    original_filename TEXT NOT NULL DEFAULT '',
-    mime_type TEXT NOT NULL DEFAULT 'video/mp4',
-    views INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-  );
-
-  CREATE TABLE IF NOT EXISTS comments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    video_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    text TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-  );
-
-  CREATE TABLE IF NOT EXISTS ratings (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    video_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    rating INTEGER NOT NULL CHECK (rating IN (-1, 1)),
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(video_id, user_id),
-    FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_videos_created_at ON videos(created_at);
-  CREATE INDEX IF NOT EXISTS idx_videos_views ON videos(views);
-  CREATE INDEX IF NOT EXISTS idx_comments_video_id ON comments(video_id);
-  CREATE INDEX IF NOT EXISTS idx_ratings_video_id ON ratings(video_id);
-`);
 
 function cleanText(value, maxLength) {
   return String(value ?? "").trim().slice(0, maxLength);
@@ -100,7 +61,7 @@ function validUsername(username) {
 
 function getVideoId(value) {
   const id = Number(value);
-  return Number.isInteger(id) && id > 0 ? id : null;
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
 }
 
 function hashToken(token) {
@@ -124,14 +85,63 @@ function authRequired(req, res, next) {
   const [scheme, token] = header.split(" ");
 
   if (scheme !== "Bearer" || !token) {
-    return res.status(401).json({ error: "Authentication required." });
+    return res.status(401).json({
+      error: "Authentication required."
+    });
   }
 
   try {
     req.user = jwt.verify(token, JWT_SECRET);
     next();
   } catch {
-    return res.status(401).json({ error: "Invalid or expired token." });
+    return res.status(401).json({
+      error: "Invalid or expired token."
+    });
+  }
+}
+
+function asyncHandler(handler) {
+  return (req, res, next) => {
+    Promise.resolve(handler(req, res, next)).catch(next);
+  };
+}
+
+function throwIfError(result) {
+  if (result.error) throw result.error;
+  return result.data;
+}
+
+function videoUrl(filename) {
+  return supabase.storage
+    .from(VIDEO_BUCKET)
+    .getPublicUrl(filename).data.publicUrl;
+}
+
+function withVideoUrl(video) {
+  return {
+    ...video,
+    video_url: videoUrl(video.filename)
+  };
+}
+
+function withUsername(row) {
+  const { users, ...rest } = row;
+
+  return {
+    ...rest,
+    username: users?.username || "unknown"
+  };
+}
+
+function deleteTempFile(filePath) {
+  if (!filePath) return;
+
+  try {
+    fs.unlinkSync(filePath);
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      console.warn("Could not remove temporary upload:", error.message);
+    }
   }
 }
 
@@ -143,22 +153,31 @@ const allowedMimeTypes = new Set([
 ]);
 
 const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
+  destination: (_req, _file, cb) => {
+    cb(null, UPLOAD_DIR);
+  },
+
   filename: (_req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase();
     const allowedExtensions = [".mp4", ".webm", ".ogg", ".mov"];
     const safeExt = allowedExtensions.includes(ext) ? ext : "";
+
     cb(null, `${crypto.randomUUID()}${safeExt}`);
   }
 });
 
 const upload = multer({
   storage,
-  limits: { fileSize: 500 * 1024 * 1024 },
+  limits: {
+    fileSize: MAX_VIDEO_SIZE
+  },
   fileFilter: (_req, file, cb) => {
     if (!allowedMimeTypes.has(file.mimetype)) {
-      return cb(new Error("Only MP4, WebM, OGG, and MOV videos are allowed."));
+      return cb(
+        new Error("Only MP4, WebM, OGG, and MOV videos are allowed.")
+      );
     }
+
     cb(null, true);
   }
 });
@@ -170,19 +189,32 @@ app.use(cors({
 }));
 
 app.use(express.json({ limit: "1mb" }));
-app.use(express.urlencoded({ extended: true, limit: "1mb" }));
+app.use(express.urlencoded({
+  extended: true,
+  limit: "1mb"
+}));
 
-app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "BALTube backend" });
-});
+// Health check also verifies database access.
+app.get("/health", asyncHandler(async (_req, res) => {
+  const result = await supabase
+    .from("users")
+    .select("id", { head: true, count: "exact" })
+    .limit(1);
 
-app.use("/uploads", express.static(UPLOAD_DIR, {
-  fallthrough: false,
-  maxAge: "1h"
+  if (result.error) throw result.error;
+
+  res.json({
+    ok: true,
+    service: "BALTube backend",
+    database: "connected",
+    storage: VIDEO_BUCKET
+  });
 }));
 
 const transporter =
-  process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS
+  process.env.SMTP_HOST &&
+  process.env.SMTP_USER &&
+  process.env.SMTP_PASS
     ? nodemailer.createTransport({
         host: process.env.SMTP_HOST,
         port: Number(process.env.SMTP_PORT || 587),
@@ -199,120 +231,152 @@ async function sendVerificationEmail(user, rawToken) {
     `${PUBLIC_URL}/api/verify-email?token=${encodeURIComponent(rawToken)}`;
 
   if (!transporter) {
-    console.log(`\nBALTube verification URL for ${user.email}:\n${verifyUrl}\n`);
+    console.log(
+      `BALTube verification URL for ${user.email}: ${verifyUrl}`
+    );
     return;
   }
 
-  const from = process.env.EMAIL_FROM || process.env.SMTP_USER;
-
   await transporter.sendMail({
-    from,
+    from: process.env.EMAIL_FROM || process.env.SMTP_USER,
     to: user.email,
     subject: "Verify your BALTube account",
+
     text:
       `Welcome to BALTube!\n\n` +
-      `Click this link to verify your account:\n${verifyUrl}\n\n` +
+      `Verify your account: ${verifyUrl}\n\n` +
       `This link expires in 24 hours.`,
+
     html: `
       <div style="font-family:Arial,sans-serif;max-width:600px;margin:auto;border:1px solid #aaa;padding:20px">
         <h1 style="color:#c00">Welcome to BALTube!</h1>
-        <p>Thanks for signing up. Click the button below to verify your account.</p>
+        <p>Thanks for signing up. Click below to verify your account.</p>
         <p>
           <a href="${verifyUrl}" style="display:inline-block;background:#c00;color:#fff;padding:12px 18px;text-decoration:none;font-weight:bold">
             VERIFY MY BALTube ACCOUNT
           </a>
         </p>
-        <p>This verification link expires in 24 hours.</p>
+        <p>This link expires in 24 hours.</p>
       </div>
     `
   });
 }
 
+// REGISTER
+app.post("/api/register", asyncHandler(async (req, res) => {
+  const username = cleanText(req.body.username, 24);
+  const email = cleanText(req.body.email, 254).toLowerCase();
+  const password = String(req.body.password || "");
 
-app.post("/api/register", async (req, res, next) => {
-  try {
-    const username = cleanText(req.body.username, 24);
-    const email = cleanText(req.body.email, 254).toLowerCase();
-    const password = String(req.body.password || "");
-
-    if (!validUsername(username)) {
-      return res.status(400).json({
-        error: "Username must be 3-24 characters and use only letters, numbers, _ or -."
-      });
-    }
-
-    if (!validEmail(email)) {
-      return res.status(400).json({
-        error: "Please enter a valid email address."
-      });
-    }
-
-    if (password.length < 8 || password.length > 200) {
-      return res.status(400).json({
-        error: "Password must be between 8 and 200 characters."
-      });
-    }
-
-    const existing = db.prepare(`
-      SELECT id, username, email FROM users
-      WHERE username = ? OR email = ?
-    `).get(username, email);
-
-    if (existing) {
-      return res.status(409).json({
-        error:
-          existing.username.toLowerCase() === username.toLowerCase()
-            ? "That username is already taken."
-            : "That email is already registered."
-      });
-    }
-
-    const passwordHash = await bcrypt.hash(password, 12);
-
-    const result = db.prepare(`
-      INSERT INTO users
-        (username, email, password, email_verified,
-         verification_token_hash, verification_expires)
-      VALUES (?, ?, ?, 1, NULL, NULL)
-    `).run(username, email, passwordHash);
-
-    res.status(201).json({
-      message: "Account created successfully! You can now log in."
+  if (!validUsername(username)) {
+    return res.status(400).json({
+      error: "Username must be 3-24 characters and use only letters, numbers, _ or -."
     });
-  } catch (error) {
-    next(error);
   }
-});
 
-app.get("/api/verify-email", (req, res) => {
+  if (!validEmail(email)) {
+    return res.status(400).json({
+      error: "Please enter a valid email address."
+    });
+  }
+
+  if (password.length < 8 || password.length > 200) {
+    return res.status(400).json({
+      error: "Password must be between 8 and 200 characters."
+    });
+  }
+
+  const existingUsername = throwIfError(
+    await supabase
+      .from("users")
+      .select("id,username,email")
+      .ilike("username", username)
+      .maybeSingle()
+  );
+
+  if (existingUsername) {
+    return res.status(409).json({
+      error: "That username is already taken."
+    });
+  }
+
+  const existingEmail = throwIfError(
+    await supabase
+      .from("users")
+      .select("id,username,email")
+      .eq("email", email)
+      .maybeSingle()
+  );
+
+  if (existingEmail) {
+    return res.status(409).json({
+      error: "That email is already registered."
+    });
+  }
+
+  const passwordHash = await bcrypt.hash(password, 12);
+
+  throwIfError(
+    await supabase.from("users").insert({
+      username,
+      email,
+      password: passwordHash,
+      email_verified: 1,
+      verification_token_hash: null,
+      verification_expires: null
+    })
+  );
+
+  res.status(201).json({
+    message: "Account created successfully! You can now log in."
+  });
+}));
+
+// VERIFY EMAIL
+app.get("/api/verify-email", asyncHandler(async (req, res) => {
   const rawToken = String(req.query.token || "");
 
-  if (!rawToken) return res.status(400).send("Invalid verification link.");
+  if (!rawToken) {
+    return res.status(400).send("Invalid verification link.");
+  }
 
-  const user = db.prepare(`
-    SELECT id, username, email, email_verified, verification_expires
-    FROM users WHERE verification_token_hash = ?
-  `).get(hashToken(rawToken));
+  const user = throwIfError(
+    await supabase
+      .from("users")
+      .select("id,username,email,email_verified,verification_expires")
+      .eq("verification_token_hash", hashToken(rawToken))
+      .maybeSingle()
+  );
 
   if (!user) {
-    return res.status(400).send("This verification link is invalid or has already been used.");
+    return res.status(400).send(
+      "This verification link is invalid or has already been used."
+    );
   }
 
   if (user.email_verified) {
     return res.send("✓ Your BALTube account is already verified.");
   }
 
-  if (!user.verification_expires || Date.now() > user.verification_expires) {
-    return res.status(400).send("This verification link has expired. Please request a new one.");
+  if (
+    !user.verification_expires ||
+    Date.now() > Number(user.verification_expires)
+  ) {
+    return res.status(400).send(
+      "This verification link has expired. Please request a new one."
+    );
   }
 
-  db.prepare(`
-    UPDATE users
-    SET email_verified = 1,
-        verification_token_hash = NULL,
-        verification_expires = NULL
-    WHERE id = ?
-  `).run(user.id);
+  throwIfError(
+    await supabase
+      .from("users")
+      .update({
+        email_verified: 1,
+        verification_token_hash: null,
+        verification_expires: null
+      })
+      .eq("id", user.id)
+  );
 
   if (FRONTEND_URL) {
     return res.redirect(`${FRONTEND_URL}/?verified=1`);
@@ -328,406 +392,625 @@ app.get("/api/verify-email", (req, res) => {
       </body>
     </html>
   `);
-});
+}));
 
-app.post("/api/resend-verification", async (req, res, next) => {
-  try {
-    const email = cleanText(req.body.email, 254).toLowerCase();
+// RESEND VERIFICATION
+app.post("/api/resend-verification", asyncHandler(async (req, res) => {
+  const email = cleanText(req.body.email, 254).toLowerCase();
 
-    if (!validEmail(email)) {
-      return res.status(400).json({ error: "Please enter a valid email address." });
-    }
+  if (!validEmail(email)) {
+    return res.status(400).json({
+      error: "Please enter a valid email address."
+    });
+  }
 
-    const user = db.prepare(`
-      SELECT id, username, email, email_verified
-      FROM users WHERE email = ?
-    `).get(email);
+  const user = throwIfError(
+    await supabase
+      .from("users")
+      .select("id,username,email,email_verified")
+      .eq("email", email)
+      .maybeSingle()
+  );
 
-    if (!user) {
-      return res.json({
-        message: "If that account exists, a new email has been sent."
-      });
-    }
-
-    if (user.email_verified) {
-      return res.json({ message: "That account is already verified." });
-    }
-
-    const rawToken = makeToken();
-
-    db.prepare(`
-      UPDATE users
-      SET verification_token_hash = ?,
-          verification_expires = ?
-      WHERE id = ?
-    `).run(hashToken(rawToken), Date.now() + 24 * 60 * 60 * 1000, user.id);
-
-    await sendVerificationEmail(user, rawToken);
-
-    res.json({
+  if (!user) {
+    return res.json({
       message: "If that account exists, a new email has been sent."
     });
-  } catch (error) {
-    next(error);
   }
-});
 
-app.post("/api/login", async (req, res, next) => {
-  try {
-    const login = cleanText(req.body.login, 254);
-    const password = String(req.body.password || "");
+  if (user.email_verified) {
+    return res.json({
+      message: "That account is already verified."
+    });
+  }
 
-    const user = db.prepare(`
-      SELECT id, username, email, password, email_verified
-      FROM users
-      WHERE username = ? COLLATE NOCASE OR email = ? COLLATE NOCASE
-    `).get(login, login);
+  const rawToken = makeToken();
 
-    if (!user) {
-      return res.status(401).json({ error: "Invalid username/email or password." });
+  throwIfError(
+    await supabase
+      .from("users")
+      .update({
+        verification_token_hash: hashToken(rawToken),
+        verification_expires: Date.now() + 24 * 60 * 60 * 1000
+      })
+      .eq("id", user.id)
+  );
+
+  await sendVerificationEmail(user, rawToken);
+
+  res.json({
+    message: "If that account exists, a new email has been sent."
+  });
+}));
+
+// LOGIN
+app.post("/api/login", asyncHandler(async (req, res) => {
+  const login = cleanText(req.body.login, 254);
+  const password = String(req.body.password || "");
+
+  let user = null;
+
+  if (login.includes("@")) {
+    user = throwIfError(
+      await supabase
+        .from("users")
+        .select("id,username,email,password,email_verified")
+        .eq("email", login.toLowerCase())
+        .maybeSingle()
+    );
+  } else {
+    user = throwIfError(
+      await supabase
+        .from("users")
+        .select("id,username,email,password,email_verified")
+        .ilike("username", login)
+        .maybeSingle()
+    );
+  }
+
+  if (!user || !(await bcrypt.compare(password, user.password))) {
+    return res.status(401).json({
+      error: "Invalid username/email or password."
+    });
+  }
+
+  if (!user.email_verified) {
+    return res.status(403).json({
+      error: "Please verify your email before logging in."
+    });
+  }
+
+  res.json({
+    token: signAuthToken(user),
+    user: {
+      id: user.id,
+      username: user.username,
+      email: user.email
     }
+  });
+}));
 
-    const passwordOK = await bcrypt.compare(password, user.password);
+// CURRENT USER
+app.get("/api/me", authRequired, asyncHandler(async (req, res) => {
+  const user = throwIfError(
+    await supabase
+      .from("users")
+      .select("id,username,email,created_at")
+      .eq("id", req.user.id)
+      .maybeSingle()
+  );
 
-    if (!passwordOK) {
-      return res.status(401).json({ error: "Invalid username/email or password." });
-    }
+  if (!user) {
+    return res.status(404).json({ error: "User not found." });
+  }
 
-    if (!user.email_verified) {
-      return res.status(403).json({
-        error: "Please verify your email before logging in."
+  res.json(user);
+}));
+
+// UPLOAD VIDEO
+app.post(
+  "/api/videos",
+  authRequired,
+  upload.single("video"),
+  asyncHandler(async (req, res) => {
+    if (!req.file) {
+      return res.status(400).json({
+        error: "No video file was uploaded."
       });
     }
 
-    const token = signAuthToken(user);
+    let storedRemotely = false;
 
-    res.json({
-      token,
-      user: {
-        id: user.id,
-        username: user.username,
-        email: user.email
+    try {
+      const title = cleanText(req.body.title, 120);
+      const description = cleanText(req.body.description, 5000);
+
+      if (!title) {
+        return res.status(400).json({
+          error: "A video title is required."
+        });
       }
-    });
-  } catch (error) {
-    next(error);
-  }
-});
 
-app.get("/api/me", authRequired, (req, res) => {
-  const user = db.prepare(`
-    SELECT id, username, email, created_at
-    FROM users WHERE id = ?
-  `).get(req.user.id);
+      const fileBuffer = await fs.promises.readFile(req.file.path);
 
-  if (!user) return res.status(404).json({ error: "User not found." });
+      const uploaded = await supabase.storage
+        .from(VIDEO_BUCKET)
+        .upload(req.file.filename, fileBuffer, {
+          contentType: req.file.mimetype,
+          upsert: false,
+          cacheControl: "3600"
+        });
 
-  res.json(user);
-});
+      if (uploaded.error) throw uploaded.error;
 
-app.post("/api/videos", authRequired, upload.single("video"), (req, res, next) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: "No video file was uploaded." });
+      storedRemotely = true;
+
+      const video = throwIfError(
+        await supabase
+          .from("videos")
+          .insert({
+            user_id: req.user.id,
+            title,
+            description,
+            filename: req.file.filename,
+            original_filename: cleanText(req.file.originalname, 255),
+            mime_type: req.file.mimetype,
+            views: 0
+          })
+          .select("id,title,description,filename,original_filename,mime_type,views,created_at,user_id")
+          .single()
+      );
+
+      res.status(201).json({
+        ...video,
+        username: req.user.username,
+        video_url: videoUrl(video.filename)
+      });
+    } catch (error) {
+      if (storedRemotely) {
+        const removal = await supabase.storage
+          .from(VIDEO_BUCKET)
+          .remove([req.file.filename]);
+
+        if (removal.error) {
+          console.error(
+            "Could not roll back uploaded file:",
+            removal.error.message
+          );
+        }
+      }
+
+      throw error;
+    } finally {
+      deleteTempFile(req.file.path);
     }
+  })
+);
 
-    const title = cleanText(req.body.title, 120);
-    const description = cleanText(req.body.description, 5000);
+// LIST VIDEOS
+async function listVideos(orderColumn, ascending) {
+  const rows = throwIfError(
+    await supabase
+      .from("videos")
+      .select("id,title,description,filename,original_filename,mime_type,views,created_at,users(username)")
+      .order(orderColumn, { ascending })
+      .limit(50)
+  );
 
-    if (!title) {
-      fs.unlinkSync(req.file.path);
-      return res.status(400).json({ error: "A video title is required." });
-    }
+  return rows.map(row => withVideoUrl(withUsername(row)));
+}
 
-    const result = db.prepare(`
-      INSERT INTO videos
-        (user_id, title, description, filename, original_filename, mime_type)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(
-      req.user.id,
-      title,
-      description,
-      req.file.filename,
-      cleanText(req.file.originalname, 255),
-      req.file.mimetype
-    );
+app.get("/api/videos", asyncHandler(async (_req, res) => {
+  res.json(await listVideos("created_at", false));
+}));
 
-    const video = db.prepare(`
-      SELECT v.id, v.title, v.description, v.filename, v.original_filename,
-             v.mime_type, v.views, v.created_at, u.username
-      FROM videos v JOIN users u ON u.id = v.user_id
-      WHERE v.id = ?
-    `).get(result.lastInsertRowid);
+app.get("/api/videos/most-viewed", asyncHandler(async (_req, res) => {
+  res.json(await listVideos("views", false));
+}));
 
-    res.status(201).json({
-      ...video,
-      video_url: `${PUBLIC_URL}/uploads/${encodeURIComponent(video.filename)}`
-    });
-  } catch (error) {
-    if (req.file) {
-      try { fs.unlinkSync(req.file.path); } catch {}
-    }
-    next(error);
-  }
-});
-
-app.get("/api/videos", (_req, res) => {
-  const videos = db.prepare(`
-    SELECT v.id, v.title, v.description, v.filename, v.original_filename,
-           v.mime_type, v.views, v.created_at, u.username
-    FROM videos v JOIN users u ON u.id = v.user_id
-    ORDER BY v.created_at DESC
-    LIMIT 50
-  `).all();
-
-  res.json(videos.map(v => ({
-    ...v,
-    video_url: `${PUBLIC_URL}/uploads/${encodeURIComponent(v.filename)}`
-  })));
-});
-
-app.get("/api/videos/most-viewed", (_req, res) => {
-  const videos = db.prepare(`
-    SELECT v.id, v.title, v.description, v.filename, v.original_filename,
-           v.mime_type, v.views, v.created_at, u.username
-    FROM videos v JOIN users u ON u.id = v.user_id
-    ORDER BY v.views DESC, v.created_at DESC
-    LIMIT 50
-  `).all();
-
-  res.json(videos.map(v => ({
-    ...v,
-    video_url: `${PUBLIC_URL}/uploads/${encodeURIComponent(v.filename)}`
-  })));
-});
-
-app.get("/api/search", (req, res) => {
+// SEARCH
+app.get("/api/search", asyncHandler(async (req, res) => {
   const q = cleanText(req.query.q, 100);
 
   if (!q) return res.json([]);
 
   const pattern = `%${q}%`;
 
-  const videos = db.prepare(`
-    SELECT v.id, v.title, v.description, v.filename, v.mime_type,
-           v.views, v.created_at, u.username
-    FROM videos v JOIN users u ON u.id = v.user_id
-    WHERE v.title LIKE ?
-       OR v.description LIKE ?
-       OR u.username LIKE ?
-    ORDER BY v.created_at DESC
-    LIMIT 50
-  `).all(pattern, pattern, pattern);
+  const [titleResult, descriptionResult, userResult] = await Promise.all([
+    supabase
+      .from("videos")
+      .select("id,title,description,filename,original_filename,mime_type,views,created_at,user_id,users(username)")
+      .ilike("title", pattern)
+      .limit(50),
 
-  res.json(videos.map(v => ({
-    ...v,
-    video_url: `${PUBLIC_URL}/uploads/${encodeURIComponent(v.filename)}`
-  })));
-});
+    supabase
+      .from("videos")
+      .select("id,title,description,filename,original_filename,mime_type,views,created_at,user_id,users(username)")
+      .ilike("description", pattern)
+      .limit(50),
 
-app.get("/api/users/:username", (req, res) => {
+    supabase
+      .from("users")
+      .select("id")
+      .ilike("username", pattern)
+      .limit(100)
+  ]);
+
+  const titleRows = throwIfError(titleResult);
+  const descriptionRows = throwIfError(descriptionResult);
+  const matchingUsers = throwIfError(userResult);
+
+  let userVideoRows = [];
+
+  if (matchingUsers.length) {
+    userVideoRows = throwIfError(
+      await supabase
+        .from("videos")
+        .select("id,title,description,filename,original_filename,mime_type,views,created_at,user_id,users(username)")
+        .in("user_id", matchingUsers.map(user => user.id))
+        .limit(50)
+    );
+  }
+
+  const unique = new Map();
+
+  [...titleRows, ...descriptionRows, ...userVideoRows].forEach(row => {
+    unique.set(String(row.id), row);
+  });
+
+  const results = [...unique.values()]
+    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+    .slice(0, 50)
+    .map(row => withVideoUrl(withUsername(row)));
+
+  res.json(results);
+}));
+
+// USER PROFILE
+app.get("/api/users/:username", asyncHandler(async (req, res) => {
   const username = cleanText(req.params.username, 24);
 
-  const user = db.prepare(`
-    SELECT id, username, created_at
-    FROM users WHERE username = ? COLLATE NOCASE
-  `).get(username);
+  const user = throwIfError(
+    await supabase
+      .from("users")
+      .select("id,username,created_at")
+      .ilike("username", username)
+      .maybeSingle()
+  );
 
-  if (!user) return res.status(404).json({ error: "User not found." });
+  if (!user) {
+    return res.status(404).json({ error: "User not found." });
+  }
 
-  const videos = db.prepare(`
-    SELECT id, title, description, filename, mime_type, views, created_at
-    FROM videos WHERE user_id = ?
-    ORDER BY created_at DESC
-  `).all(user.id);
+  const videos = throwIfError(
+    await supabase
+      .from("videos")
+      .select("id,title,description,filename,mime_type,views,created_at")
+      .eq("user_id", user.id)
+      .order("created_at", { ascending: false })
+  );
 
   res.json({
     ...user,
-    videos: videos.map(v => ({
-      ...v,
-      video_url: `${PUBLIC_URL}/uploads/${encodeURIComponent(v.filename)}`
-    }))
+    videos: videos.map(withVideoUrl)
   });
-});
+}));
 
-app.get("/api/videos/:id", (req, res) => {
+// LIKE/DISLIKE TOTALS
+async function getRatingTotals(videoId) {
+  const rows = throwIfError(
+    await supabase
+      .from("ratings")
+      .select("rating")
+      .eq("video_id", videoId)
+  );
+
+  return rows.reduce((totals, row) => {
+    if (row.rating === 1) totals.likes += 1;
+    if (row.rating === -1) totals.dislikes += 1;
+    return totals;
+  }, {
+    likes: 0,
+    dislikes: 0
+  });
+}
+
+// SINGLE VIDEO
+app.get("/api/videos/:id", asyncHandler(async (req, res) => {
   const id = getVideoId(req.params.id);
 
-  if (!id) return res.status(400).json({ error: "Invalid video ID." });
+  if (!id) {
+    return res.status(400).json({ error: "Invalid video ID." });
+  }
 
-  const video = db.prepare(`
-    SELECT v.id, v.title, v.description, v.filename, v.original_filename,
-           v.mime_type, v.views, v.created_at, v.user_id, u.username
-    FROM videos v JOIN users u ON u.id = v.user_id
-    WHERE v.id = ?
-  `).get(id);
+  const row = throwIfError(
+    await supabase
+      .from("videos")
+      .select("id,title,description,filename,original_filename,mime_type,views,created_at,user_id,users(username)")
+      .eq("id", id)
+      .maybeSingle()
+  );
 
-  if (!video) return res.status(404).json({ error: "Video not found." });
-
-  const rating = db.prepare(`
-    SELECT
-      COALESCE(SUM(CASE WHEN rating = 1 THEN 1 ELSE 0 END), 0) AS likes,
-      COALESCE(SUM(CASE WHEN rating = -1 THEN 1 ELSE 0 END), 0) AS dislikes
-    FROM ratings WHERE video_id = ?
-  `).get(id);
-
-  res.json({
-    ...video,
-    video_url: `${PUBLIC_URL}/uploads/${encodeURIComponent(video.filename)}`,
-    likes: rating.likes,
-    dislikes: rating.dislikes
-  });
-});
-
-app.post("/api/videos/:id/view", (req, res) => {
-  const id = getVideoId(req.params.id);
-
-  if (!id) return res.status(400).json({ error: "Invalid video ID." });
-
-  const result = db.prepare(`
-    UPDATE videos SET views = views + 1 WHERE id = ?
-  `).run(id);
-
-  if (!result.changes) {
+  if (!row) {
     return res.status(404).json({ error: "Video not found." });
   }
 
-  res.json(db.prepare(`
-    SELECT views FROM videos WHERE id = ?
-  `).get(id));
-});
+  const totals = await getRatingTotals(id);
 
-app.get("/api/videos/:id/comments", (req, res) => {
+  res.json({
+    ...withVideoUrl(withUsername(row)),
+    likes: totals.likes,
+    dislikes: totals.dislikes
+  });
+}));
+
+// COUNT VIDEO VIEW
+app.post("/api/videos/:id/view", asyncHandler(async (req, res) => {
   const id = getVideoId(req.params.id);
 
-  if (!id) return res.status(400).json({ error: "Invalid video ID." });
-
-  const comments = db.prepare(`
-    SELECT c.id, c.text, c.created_at, u.username
-    FROM comments c JOIN users u ON u.id = c.user_id
-    WHERE c.video_id = ?
-    ORDER BY c.created_at ASC
-  `).all(id);
-
-  res.json(comments);
-});
-
-app.post("/api/videos/:id/comments", authRequired, (req, res) => {
-  const id = getVideoId(req.params.id);
-  const text = cleanText(req.body.text, 1000);
-
-  if (!id) return res.status(400).json({ error: "Invalid video ID." });
-  if (!text) return res.status(400).json({ error: "Comment cannot be empty." });
-
-  const video = db.prepare(`
-    SELECT id FROM videos WHERE id = ?
-  `).get(id);
-
-  if (!video) return res.status(404).json({ error: "Video not found." });
-
-  const result = db.prepare(`
-    INSERT INTO comments (video_id, user_id, text)
-    VALUES (?, ?, ?)
-  `).run(id, req.user.id, text);
-
-  const comment = db.prepare(`
-    SELECT c.id, c.text, c.created_at, u.username
-    FROM comments c JOIN users u ON u.id = c.user_id
-    WHERE c.id = ?
-  `).get(result.lastInsertRowid);
-
-  res.status(201).json(comment);
-});
-
-app.get("/api/videos/:id/rating", (req, res) => {
-  const id = getVideoId(req.params.id);
-
-  if (!id) return res.status(400).json({ error: "Invalid video ID." });
-
-  const totals = db.prepare(`
-    SELECT
-      COALESCE(SUM(CASE WHEN rating = 1 THEN 1 ELSE 0 END), 0) AS likes,
-      COALESCE(SUM(CASE WHEN rating = -1 THEN 1 ELSE 0 END), 0) AS dislikes
-    FROM ratings WHERE video_id = ?
-  `).get(id);
-
-  res.json(totals);
-});
-
-app.post("/api/videos/:id/rating", authRequired, (req, res) => {
-  const id = getVideoId(req.params.id);
-  const rating = Number(req.body.rating);
-
-  if (!id) return res.status(400).json({ error: "Invalid video ID." });
-  if (![1, -1].includes(rating)) {
-    return res.status(400).json({ error: "Rating must be 1 or -1." });
+  if (!id) {
+    return res.status(400).json({ error: "Invalid video ID." });
   }
 
-  const video = db.prepare(`
-    SELECT id FROM videos WHERE id = ?
-  `).get(id);
+  const current = throwIfError(
+    await supabase
+      .from("videos")
+      .select("views")
+      .eq("id", id)
+      .maybeSingle()
+  );
 
-  if (!video) return res.status(404).json({ error: "Video not found." });
+  if (!current) {
+    return res.status(404).json({ error: "Video not found." });
+  }
 
-  db.prepare(`
-    INSERT INTO ratings (video_id, user_id, rating)
-    VALUES (?, ?, ?)
-    ON CONFLICT(video_id, user_id)
-    DO UPDATE SET rating = excluded.rating
-  `).run(id, req.user.id, rating);
+  const updated = throwIfError(
+    await supabase
+      .from("videos")
+      .update({ views: Number(current.views || 0) + 1 })
+      .eq("id", id)
+      .select("views")
+      .single()
+  );
 
-  const totals = db.prepare(`
-    SELECT
-      COALESCE(SUM(CASE WHEN rating = 1 THEN 1 ELSE 0 END), 0) AS likes,
-      COALESCE(SUM(CASE WHEN rating = -1 THEN 1 ELSE 0 END), 0) AS dislikes
-    FROM ratings WHERE video_id = ?
-  `).get(id);
+  res.json(updated);
+}));
 
-  res.json(totals);
-});
+// GET COMMENTS
+app.get("/api/videos/:id/comments", asyncHandler(async (req, res) => {
+  const id = getVideoId(req.params.id);
 
-app.delete("/api/videos/:id", authRequired, (req, res, next) => {
-  try {
+  if (!id) {
+    return res.status(400).json({ error: "Invalid video ID." });
+  }
+
+  const rows = throwIfError(
+    await supabase
+      .from("comments")
+      .select("id,text,created_at,users(username)")
+      .eq("video_id", id)
+      .order("created_at", { ascending: true })
+  );
+
+  res.json(rows.map(withUsername));
+}));
+
+// POST COMMENT
+app.post(
+  "/api/videos/:id/comments",
+  authRequired,
+  asyncHandler(async (req, res) => {
+    const id = getVideoId(req.params.id);
+    const text = cleanText(req.body.text, 1000);
+
+    if (!id) {
+      return res.status(400).json({ error: "Invalid video ID." });
+    }
+
+    if (!text) {
+      return res.status(400).json({
+        error: "Comment cannot be empty."
+      });
+    }
+
+    const video = throwIfError(
+      await supabase
+        .from("videos")
+        .select("id")
+        .eq("id", id)
+        .maybeSingle()
+    );
+
+    if (!video) {
+      return res.status(404).json({ error: "Video not found." });
+    }
+
+    const comment = throwIfError(
+      await supabase
+        .from("comments")
+        .insert({
+          video_id: id,
+          user_id: req.user.id,
+          text
+        })
+        .select("id,text,created_at,users(username)")
+        .single()
+    );
+
+    res.status(201).json(withUsername(comment));
+  })
+);
+
+// GET RATINGS
+app.get("/api/videos/:id/rating", asyncHandler(async (req, res) => {
+  const id = getVideoId(req.params.id);
+
+  if (!id) {
+    return res.status(400).json({ error: "Invalid video ID." });
+  }
+
+  res.json(await getRatingTotals(id));
+}));
+
+// POST RATING
+app.post(
+  "/api/videos/:id/rating",
+  authRequired,
+  asyncHandler(async (req, res) => {
+    const id = getVideoId(req.params.id);
+    const rating = Number(req.body.rating);
+
+    if (!id) {
+      return res.status(400).json({ error: "Invalid video ID." });
+    }
+
+    if (![1, -1].includes(rating)) {
+      return res.status(400).json({
+        error: "Rating must be 1 or -1."
+      });
+    }
+
+    const video = throwIfError(
+      await supabase
+        .from("videos")
+        .select("id")
+        .eq("id", id)
+        .maybeSingle()
+    );
+
+    if (!video) {
+      return res.status(404).json({ error: "Video not found." });
+    }
+
+    throwIfError(
+      await supabase
+        .from("ratings")
+        .upsert({
+          video_id: id,
+          user_id: req.user.id,
+          rating
+        }, {
+          onConflict: "video_id,user_id"
+        })
+    );
+
+    res.json(await getRatingTotals(id));
+  })
+);
+
+// DELETE VIDEO
+app.delete(
+  "/api/videos/:id",
+  authRequired,
+  asyncHandler(async (req, res) => {
     const id = getVideoId(req.params.id);
 
-    if (!id) return res.status(400).json({ error: "Invalid video ID." });
+    if (!id) {
+      return res.status(400).json({ error: "Invalid video ID." });
+    }
 
-    const video = db.prepare(`
-      SELECT id, filename, user_id
-      FROM videos WHERE id = ?
-    `).get(id);
+    const video = throwIfError(
+      await supabase
+        .from("videos")
+        .select("id,filename,user_id")
+        .eq("id", id)
+        .maybeSingle()
+    );
 
-    if (!video) return res.status(404).json({ error: "Video not found." });
+    if (!video) {
+      return res.status(404).json({ error: "Video not found." });
+    }
 
-    if (video.user_id !== req.user.id) {
+    if (String(video.user_id) !== String(req.user.id)) {
       return res.status(403).json({
         error: "You can only delete your own videos."
       });
     }
 
-    db.prepare("DELETE FROM videos WHERE id = ?").run(id);
+    const removedFile = await supabase.storage
+      .from(VIDEO_BUCKET)
+      .remove([video.filename]);
 
-    try {
-      fs.unlinkSync(path.join(UPLOAD_DIR, video.filename));
-    } catch (error) {
-      if (error.code !== "ENOENT") {
-        console.warn("Could not delete video file:", error.message);
-      }
-    }
+    if (removedFile.error) throw removedFile.error;
+
+    throwIfError(
+      await supabase
+        .from("videos")
+        .delete()
+        .eq("id", id)
+    );
 
     res.json({ message: "Video deleted." });
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
+// ACCOUNT RECOVERY
+app.post("/api/recover-account", asyncHandler(async (req, res) => {
+  const suppliedSecret = String(req.body.secret || "");
+
+  if (
+    !process.env.BAL_RECOVERY_SECRET ||
+    suppliedSecret !== process.env.BAL_RECOVERY_SECRET
+  ) {
+    return res.status(403).json({
+      error: "Recovery not authorized."
+    });
+  }
+
+  const username = cleanText(req.body.username, 24);
+  const newPassword = String(req.body.newPassword || "");
+
+  if (!validUsername(username)) {
+    return res.status(400).json({
+      error: "Invalid username."
+    });
+  }
+
+  if (newPassword.length < 8 || newPassword.length > 200) {
+    return res.status(400).json({
+      error: "Password must be between 8 and 200 characters."
+    });
+  }
+
+  const user = throwIfError(
+    await supabase
+      .from("users")
+      .select("id")
+      .ilike("username", username)
+      .maybeSingle()
+  );
+
+  if (!user) {
+    return res.status(404).json({
+      error: "Account not found."
+    });
+  }
+
+  const passwordHash = await bcrypt.hash(newPassword, 12);
+
+  throwIfError(
+    await supabase
+      .from("users")
+      .update({ password: passwordHash })
+      .eq("id", user.id)
+  );
+
+  res.json({
+    message: "Password reset successfully. You can now log in."
+  });
+}));
+
+// ERROR HANDLING
 app.use((err, _req, res, _next) => {
-  console.error(err);
+  console.error(
+    "BALTube request error:",
+    err && (err.message || err)
+  );
 
   if (err instanceof multer.MulterError) {
     if (err.code === "LIMIT_FILE_SIZE") {
       return res.status(413).json({
-        error: "Video is too large. Maximum size is 500 MB."
+        error: "Video is too large. Maximum size on this BALTube storage setup is 50 MB."
       });
     }
 
@@ -735,77 +1018,41 @@ app.use((err, _req, res, _next) => {
   }
 
   if (
-    err.message === "Only MP4, WebM, OGG, and MOV videos are allowed." ||
-    err.message === "CORS blocked this origin."
+    err.message === "Only MP4, WebM, OGG, and MOV videos are allowed."
   ) {
     return res.status(400).json({ error: err.message });
   }
 
-  res.status(500).json({ error: "Internal server error." });
-});
-
-
-app.post("/api/recover-account", async (req, res, next) => {
-  try {
-    const suppliedSecret = String(req.body.secret || "");
-
-    if (
-      !process.env.BAL_RECOVERY_SECRET ||
-      suppliedSecret !== process.env.BAL_RECOVERY_SECRET
-    ) {
-      return res.status(403).json({
-        error: "Recovery not authorized."
-      });
-    }
-
-    const username = cleanText(req.body.username, 24);
-    const newPassword = String(req.body.newPassword || "");
-
-    if (!validUsername(username)) {
-      return res.status(400).json({
-        error: "Invalid username."
-      });
-    }
-
-    if (newPassword.length < 8 || newPassword.length > 200) {
-      return res.status(400).json({
-        error: "Password must be between 8 and 200 characters."
-      });
-    }
-
-    const user = db.prepare(`
-      SELECT id FROM users
-      WHERE username = ? COLLATE NOCASE
-    `).get(username);
-
-    if (!user) {
-      return res.status(404).json({
-        error: "Account not found."
-      });
-    }
-
-    const passwordHash = await bcrypt.hash(newPassword, 12);
-
-    db.prepare(`
-      UPDATE users
-      SET password = ?
-      WHERE id = ?
-    `).run(passwordHash, user.id);
-
-    res.json({
-      message: "Password reset successfully. You can now log in."
+  if (err.code === "23505") {
+    return res.status(409).json({
+      error: "That username or email is already registered."
     });
-  } catch (error) {
-    next(error);
   }
+
+  const message = String(err.message || "");
+
+  if (
+    /payload too large|maximum allowed size|file size/i.test(message)
+  ) {
+    return res.status(413).json({
+      error: "Video exceeds the storage upload limit. Maximum size is 50 MB on the Supabase Free plan."
+    });
+  }
+
+  res.status(500).json({
+    error: "Internal server error. Please check the Render logs for details."
+  });
 });
 
-
+// START SERVER
 app.listen(PORT, () => {
   console.log(`BALTube backend running on port ${PORT}`);
-  console.log(`Database: ${DB_PATH}`);
-  console.log(`Uploads: ${UPLOAD_DIR}`);
+  console.log("Database: Supabase PostgreSQL");
+  console.log(`Video storage: Supabase Storage bucket '${VIDEO_BUCKET}'`);
+  console.log(`Temporary upload staging: ${UPLOAD_DIR}`);
   console.log(`Public URL: ${PUBLIC_URL}`);
   console.log(`Frontend URL: ${FRONTEND_URL || "(CORS open)"}`);
-  console.log(`SMTP: ${transporter ? "configured" : "not configured (verification URLs will be logged)"}`);
+  console.log(
+    `SMTP: ${transporter ? "configured" : "not configured (verification URLs will be logged)"}`
+  );
 });
