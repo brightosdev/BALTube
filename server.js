@@ -228,6 +228,7 @@ async function sendVerificationEmail(user, rawToken) {
   });
 }
 
+
 app.post("/api/register", async (req, res, next) => {
   try {
     const username = cleanText(req.body.username, 24);
@@ -241,7 +242,9 @@ app.post("/api/register", async (req, res, next) => {
     }
 
     if (!validEmail(email)) {
-      return res.status(400).json({ error: "Please enter a valid email address." });
+      return res.status(400).json({
+        error: "Please enter a valid email address."
+      });
     }
 
     if (password.length < 8 || password.length > 200) {
@@ -265,32 +268,16 @@ app.post("/api/register", async (req, res, next) => {
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
-    const rawToken = makeToken();
-    const tokenHash = hashToken(rawToken);
-    const expires = Date.now() + 24 * 60 * 60 * 1000;
 
     const result = db.prepare(`
       INSERT INTO users
-        (username, email, password, email_verified, verification_token_hash, verification_expires)
-      VALUES (?, ?, ?, 0, ?, ?)
-    `).run(username, email, passwordHash, tokenHash, expires);
-
-    const user = db.prepare(`
-      SELECT id, username, email FROM users WHERE id = ?
-    `).get(result.lastInsertRowid);
-
-    try {
-      await sendVerificationEmail(user, rawToken);
-    } catch (emailError) {
-      db.prepare("DELETE FROM users WHERE id = ?").run(user.id);
-      console.error("Verification email failed:", emailError);
-      return res.status(500).json({
-        error: "The verification email could not be sent. Please try again."
-      });
-    }
+        (username, email, password, email_verified,
+         verification_token_hash, verification_expires)
+      VALUES (?, ?, ?, 1, NULL, NULL)
+    `).run(username, email, passwordHash);
 
     res.status(201).json({
-      message: "Account created. Check your email to verify it."
+      message: "Account created successfully! You can now log in."
     });
   } catch (error) {
     next(error);
