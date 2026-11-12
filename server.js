@@ -1001,11 +1001,13 @@ app.post("/api/recover-account", asyncHandler(async (req, res) => {
 }));
 
 // ERROR HANDLING
-app.use((err, _req, res, _next) => {
+app.use((err, req, res, _next) => {
   console.error(
-    "BALTube request error:",
-    err && (err.message || err)
+    `[BALTube] ${req.method} ${req.originalUrl}`
   );
+
+  console.error("Full error:", err);
+  console.error("Underlying cause:", err?.cause || "No additional cause");
 
   if (err instanceof multer.MulterError) {
     if (err.code === "LIMIT_FILE_SIZE") {
