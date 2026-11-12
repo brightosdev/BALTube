@@ -445,7 +445,10 @@ app.post("/api/resend-verification", asyncHandler(async (req, res) => {
 
 // LOGIN
 app.post("/api/login", asyncHandler(async (req, res) => {
-  const login = cleanText(req.body.login, 254);
+  const login = cleanText(
+  req.body.login || req.body.email || req.body.username,
+  254
+);
   const password = String(req.body.password || "");
 
   let user = null;
